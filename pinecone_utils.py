@@ -2,30 +2,90 @@ import hashlib
 import os
 import uuid
 from typing import List
-import pinecone
-import openai
+from pinecone import Pinecone
 import streamlit as st
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.qa_with_sources import load_qa_with_sources_chain
-from langchain.llms import OpenAI
-from langchain.docstore.document import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from openai import OpenAI
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import ChatOpenAI
 
 
-MODEL = "text-embedding-ada-002"
+TEXT_MODEL = "text-embedding-ada-002"
+QA_MODEL = "gpt-4o-mini"
+NAMESPACE_KEY = "sample-app"
 
 
 # API keys
 os.environ['OPENAI_API_KEY'] = st.secrets["OPENAI_API_KEY"]
-os.environ['LANGCHAIN_HANDLER'] = 'langchain'
+os.environ['PINECONE_API_KEY'] = st.secrets["PINECONE_API_KEY"]
+os.environ['INDEX_HOST'] = st.secrets["INDEX_HOST"]
 
-os.environ['PINECONE_API_KEY'] = "b228e7a2-027a-4b3e-b65b-c06e8931c4e4"
-os.environ['PINECONE_API_ENV'] = "gcp-starter"
-os.environ['PINECONE_INDEX_NAME'] = "rag"
+# create client
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+index = pc.Index(host=os.environ["INDEX_HOST"])
 
 
-openai.api_key=os.environ['OPENAI_API_KEY']
-pinecone.init( api_key=os.environ['PINECONE_API_KEY'], environment=os.environ['PINECONE_API_ENV'])
-pinecone_index=pinecone.Index(os.environ['PINECONE_INDEX_NAME'])
+
+COMMON_TEMPLATE = """
+"Use the following pieces of context to answer the question at the end with human readable answer as a paragraph"
+"Please do not use data outside the context to answer any questions. "
+"If the answer is not in the given context, just say that you don't have enough context."
+"don't try to make up an answer. "
+"\n\n"
+{context}
+"\n\n"
+Question: {question}
+"n"
+"Helpful answer:   "
+"""
+
+def get_model():
+    model = ChatOpenAI(model=QA_MODEL, api_key=os.environ["OPENAI_API_KEY"])
+    return model
+
+
+def get_openai_embeddings(text: str) -> list[float]:
+    # create client
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    response = client.embeddings.create(input=f"{text}", model=TEXT_MODEL)
+
+    return response.data[0].embedding
+
+
+def upsert_embeddings(embeddings, meta_data, namespace_ = NAMESPACE_KEY):
+    vector_id = str(uuid.uuid4())
+    upsert_response = index.upsert(
+    vectors=[
+        (vector_id, embeddings, meta_data),
+    ],
+    namespace=namespace_
+    )
+
+    return upsert_response
+
+
+# function query similar chunks
+def query_response(query_embedding, k = 2, namespace_ = NAMESPACE_KEY):
+    query_response = index.query(
+        namespace=namespace_,
+        vector=query_embedding,
+        top_k=k,
+        include_values=False,
+        include_metadata=True,
+    )
+
+    return query_response
+
+
+def content_extractor(similar_data):
+    top_values = similar_data["matches"]
+    # get the text out
+    text_content = [sub_content["metadata"]["text"] for sub_content in top_values]
+    return " ".join(text_content)
 
 
 def upload_to_pinecone(text_document: str, file_name, chunk_size: int = 1000 ) -> None:
@@ -53,96 +113,52 @@ def upload_to_pinecone(text_document: str, file_name, chunk_size: int = 1000 ) -
     # text splitter
     texts = text_splitter.create_documents([text_document])
 
-    for index, sub_docs in enumerate(texts):
-        document_hash = hashlib.md5(sub_docs.page_content.encode("utf-8"))
-        embedding = openai.embeddings.create(model= MODEL,input=sub_docs.page_content).data[0].embedding
-        metadata = {"doc_name":file_name, "chunk": str(uuid.uuid4()), "text": sub_docs.page_content, "doc_index":index}
-        pinecone_index.upsert([(document_hash.hexdigest(), embedding, metadata)])
-        print("{} ==> Done".format(index))
-
-    print("Done!")
+    for chunk_document in texts:
+        chunk_text_data = chunk_document.page_content
+        # get embeddings
+        embeddings = get_openai_embeddings(chunk_text_data)
+        # create metadata
+        meta_creator = {"text": chunk_text_data}
+        # store embeddings
+        emb_response = upsert_embeddings(embeddings, meta_creator)
 
     return True
 
 
-def filter_matching_docs(question: str, top_chunks: int = 3, get_text: bool = False) -> List:
-    """
-    Semnatic search between user content and vector DB
+def get_similar_context(question: str):
+    # get the query embeddings
+    quer_embed_data = get_openai_embeddings(question)
 
-    @param
-    question: user question
-    top_chunks: number of most similar content ot be filtered
-    get_text: if True, return only the text not the document
+    # query the similar chunks
+    similar_chunks = query_response(quer_embed_data)
 
-    @return
-    list of similar content
-    """
-    
-    index=pinecone.Index(os.environ['PINECONE_INDEX_NAME'])
+    # extract the similar text data
+    similar_content = content_extractor(similar_chunks)
 
-    question_embed_call = openai.embeddings.create(input = question ,model = MODEL)
-    query_embeds = question_embed_call.data[0].embedding
-    response = index.query(query_embeds,top_k = top_chunks,include_metadata = True)
-
-    #get the data out
-    filtered_data = []
-    filtered_text = []
-
-    for content in response["matches"]:
-        #save the meta data as a dictionary
-        info = {}
-        info["id"] = content.get("id", "")
-        info["score"] = content.get("score", "")
-        # get the saved metadat info
-        content_metadata = content.get("metadata","")
-        # combine it it info
-        info["filename"] = content_metadata.get("doc_name", "")
-        info["chunk"] = content_metadata.get("chunk", "")
-        info["text"] = content_metadata.get("text", "")
-        filtered_text.append(content_metadata.get("text", ""))
-
-        #append the data
-        filtered_data.append(info)
-
-    if get_text:
-        similar_text = " ".join([text for text in filtered_text])
-        print(similar_text)
-        return similar_text
-
-    print(filtered_data)
-
-    return filtered_data
+    return similar_content
 
 
-def QA_with_your_docs(user_question: str, text_list: List[str], chain_type: str = "stuff") -> str:
-    """
-    This is the main function to chat with the content you have
+def question_answering(query_question, context_text, template=COMMON_TEMPLATE):
+    prompt = ChatPromptTemplate.from_template(template)
+    model = get_model()
+    output_parser = StrOutputParser()
 
-    @param
-    user_question: question or context user wants to figure out
-    text: list of similar texts
-    chat_type: Type of chain run (stuff is cost effective)
+    # create the chain
+    chain = prompt | model | output_parser
 
-    @return
-    answers from the LLM
-    """
-    llm = OpenAI(temperature=0, openai_api_key = os.environ['OPENAI_API_KEY'])
-    chain = load_qa_with_sources_chain(llm, chain_type = chain_type, verbose = False)
+    # get the answer
+    answer = chain.invoke({"context": context_text, "question": query_question})
 
-    all_docs = []
-    for doc_content in text_list:
-        metadata = {}
-        doc_text = doc_content.get("text", "")
-        metadata["id"] = doc_content.get("id", "")
-        metadata["score"] = doc_content.get("score", "")
-        metadata["filename"] = doc_content.get("filename", "")
-        metadata["chunk"] = doc_content.get("chunk", "")
-        chunk_name = doc_content.get("filename", "UNKNOWN")
-        offset=", OFFSET="+str(doc_content.get("chunk","UNKNOWN"))
-        metadata["source"] = chunk_name + offset
-        all_docs.append(Document(page_content = doc_text, metadata = metadata))
+    return answer
 
-    chain_response = chain.run(input_documents = all_docs, question = user_question )
-    print(chain_response)
 
-    return chain_response
+def streaming_question_answering(query_question: str, context_text: str,  template: str = COMMON_TEMPLATE):
+    prompt = ChatPromptTemplate.from_template(template)
+    model = get_model()
+    output_parser = StrOutputParser()
+
+    # create the chain
+    chain = prompt | model | output_parser
+
+    # get the answer
+    return chain.stream({"context": context_text, "question": query_question})
